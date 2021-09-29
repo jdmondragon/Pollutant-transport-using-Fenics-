@@ -1,0 +1,107 @@
+import meshio
+msh = meshio.read("Mesh.msh")
+for cell in msh.cells:
+    if cell.type == "triangle":
+        triangle_cells = cell.data
+    elif  cell.type == "tetra":
+        tetra_cells = cell.data
+
+for key in msh.cell_data_dict["gmsh:physical"].keys():
+    if key == "triangle":
+        triangle_data = msh.cell_data_dict["gmsh:physical"][key]
+    elif key == "tetra":
+        tetra_data = msh.cell_data_dict["gmsh:physical"][key]
+tetra_mesh = meshio.Mesh(points=msh.points, cells={"tetra": tetra_cells})
+triangle_mesh =meshio.Mesh(points=msh.points,
+                           cells=[("triangle", triangle_cells)],
+                           cell_data={"name_to_read":[triangle_data]})
+meshio.write("mesh.xdmf", tetra_mesh)
+
+meshio.write("mf.xdmf", triangle_mesh)
+
+from dolfin import *
+import matplotlib.pyplot as plt
+import math
+import numpy as np
+set_log_level(LogLevel.ERROR)
+
+mesh = Mesh()
+with XDMFFile("mesh.xdmf") as infile:
+    infile.read(mesh)
+mvc = MeshValueCollection("size_t", mesh, 2)
+with XDMFFile("mf.xdmf") as infile:
+    infile.read(mvc, "name_to_read")
+mf = cpp.mesh.MeshFunctionSizet(mesh, mvc)
+
+# Defining the function space
+V = FunctionSpace(mesh,'Lagrange', 1)
+
+# Define boundary condition
+ux=Expression('x[0]',degree=1)
+bc_Inx=DirichletBC(V,ux, mf, 1)
+bc_Outx= DirichletBC(V,ux, mf, 2)
+bcx=[bc_Inx, bc_Outx]
+uy=Expression('x[1]',degree=1)
+bc_Iny=DirichletBC(V,uy, mf, 3)
+bc_Outy= DirichletBC(V,uy, mf, 4)
+bcy=[bc_Iny, bc_Outy]
+
+# Test and trial function
+u = TrialFunction(V)
+w = TrialFunction(V)
+v = TestFunction(V)
+
+# Define variational problem
+f = Constant(0)
+ax = -dot(grad(u), grad(v))*dx
+ay = -dot(grad(w), grad(v))*dx
+L = f*v*dx
+
+# Solution function
+u = Function(V)
+w = Function(V)
+# Assemble the LHS Matrix A and RHS Vector b 
+Ax = PETScMatrix()
+assemble(ax, tensor=Ax)
+bx = PETScVector()
+assemble(L, tensor=bx)
+[bc.apply(Ax, bx) for bc in bcx]
+
+Ay = PETScMatrix()
+assemble(ay, tensor=Ay)
+by = PETScVector()
+assemble(L, tensor=by)
+[bc.apply(Ay, by) for bc in bcy]
+# Solve the linear System of Equation
+solve(Ax, u.vector(), bx,"gmres", "ilu")
+solve(Ay, w.vector(), by,"gmres", "ilu")
+    
+
+#Save the solution
+
+Hdf=HDF5File(mesh.mpi_comm(),'SS_VEL/velpot_x',"w") #"w" means write 
+Hdf.write(u,'u')
+Hdf.close()
+Hdf=HDF5File(mesh.mpi_comm(),'SS_VEL/velpot_y',"w")
+Hdf.write(w,'w')
+Hdf.close()
+
+# Compute gradient of u 
+velx= grad(u) # Velocity field in the x axis
+vely= grad(w) # Velocity field in the y axis
+W=VectorFunctionSpace(mesh,"Lagrange",1)
+velvecx=project(velx,W,solver_type ='cg', preconditioner_type ='amg')# Velocity vector in the x axis 
+velvecy=project(vely,W,solver_type ='cg', preconditioner_type ='amg')# Velocity vector in the y axis
+
+#Save VTK files for visualisation
+vtkfile=File('Edit/velvis_x.pvd')
+vtkfile << velvecx
+vtkfile=File('Edit/potvis_x.pvd')
+vtkfile << u
+vtkfile=File('Edit/velvis_y.pvd')
+vtkfile << velvecy
+vtkfile=File('Edit/potvis_y.pvd')
+vtkfile << w
+
+# Saving the mesh 
+File ('SS_VEL/Domain.xml.gz') << mesh
