@@ -1,0 +1,136 @@
+from dolfin import *
+# parameters["reorder_dofs_serial"] = False
+import matplotlib.pyplot as plt
+import math
+import numpy as np
+set_log_level(LogLevel.ERROR)
+
+mesh = Mesh ('SS_VEL/dBM.xml.gz')
+with XDMFFile("mesh.xdmf") as infile:
+    infile.read(mesh)
+mvc = MeshValueCollection("size_t", mesh, 2)
+with XDMFFile("mf.xdmf") as infile:
+    infile.read(mvc, "name_to_read")
+mf = cpp.mesh.MeshFunctionSizet(mesh, mvc)
+
+
+# Defining the function spaces
+V_c = FunctionSpace(mesh, 'P', 1)
+
+#import potential field in x axis
+f=HDF5File(mesh.mpi_comm(),'SS_VEL/velpot_x_BM','r')
+u=Function(V_c)
+f.read(u,'u')
+f.close()
+phix= u # save the potential field  
+#import potential field in y axis
+f=HDF5File(mesh.mpi_comm(),'SS_VEL/velpot_y_BM','r')
+w=Function(V_c)
+f.read(w,'w')
+f.close()
+phiy= w # save the potential field  
+# Velocity field
+vel_x= grad(phix)
+vel_y= grad(phiy)
+
+# Set up boundary condition (apply strong BCs)
+bc_Con= DirichletBC(V_c, Constant(2.1e-7), mf, 6)
+#zero concentration on the inflow face
+bc_Inx= DirichletBC(V_c, Constant(0), mf, 1)
+bc_Iny= DirichletBC(V_c, Constant(0), mf, 3)
+bcs= [ bc_Con, bc_Inx, bc_Iny]
+
+
+# Test function
+v = TestFunction(V_c)
+
+ # Source term
+f = Constant(0.0)
+# Mesh-related functions
+h = CellDiameter(mesh)
+
+#STABILIZATION CROSSWIND TERMS
+
+I= Identity(mesh.geometry().dim())
+def q(c): 
+    return (sqrt(dot(dot(u,grad(c)),dot(u,grad(c))))/sqrt(dot(grad(c),grad(c))))
+
+ct=0
+
+snapshot=np.zeros((mesh.num_vertices(),420))
+for theta in np.linspace(0, pi/2, num=30):
+    for vmag in np.linspace(0.5, 7, num=14):
+        eps = 1.0           # error measure ||u-u_k||
+        tol = 1.0E-4        # tolerance
+        iter = 0            # iteration counter
+        maxiter = 50       # max no of iterations allowed
+        c = TrialFunction(V_c)
+        # velocity
+        u=float(vmag)*(cos(theta)*vel_x+sin(theta)*vel_y)
+        #diffusivity
+        diff=Constant(1.2e-4)
+        # concrete porosity 
+        #betta=Constant(-0.004)
+        #STABILIZATION TERMS
+        vnorm=sqrt(dot(u,u))
+        Pe=vnorm*h/(2*diff)
+        tau_supg=(h/(2*vnorm))*(1+9/(Pe**2))**(-0.5)
+        # Galerkin variational problem
+        F=(diff*dot(grad(c),grad(v))+np.dot(u,grad(c))*v)*dx-f*v*dx#+(betta*c*v)*ds
+        # Add SUPG stabilization terms
+        F += np.dot(u,grad(v))*tau_supg*np.dot(u,grad(c))*dx
+        # Create bilinear and linear forms
+        a = lhs(F)
+        L = rhs(F)
+        # Solution function
+        c= Function(V_c)
+        A = PETScMatrix()
+        assemble(a, tensor=A)
+        b = PETScVector()
+        assemble(L, tensor=b)
+        [bc.apply(A, b) for bc in bcs]
+        # Solve system
+        solve(A, c.vector(), b,"gmres", "ilu")
+        c_k = c # solution from SUPG stabilization 
+        # Define variational problem for Picard iteration
+        del a, L, F, c, A, b
+        c = TrialFunction(V_c)
+        # Galerkin variational problem
+        F=(diff*dot(grad(c),grad(v))+np.dot(u,grad(c))*v)*dx-f*v*dx#+(betta*c*v)*ds
+        # Add SUPG stabilization terms
+        F += np.dot(u,grad(v))*tau_supg*np.dot(u,grad(c))*dx
+        # Add crosswind stabilization terms
+        alpha= Constant(0.7)
+        CWD=(I-(outer(u,u)/sqrt(dot(dot(u,u),dot(u,u)))))
+        F += dot(dot(0.5*alpha*h*q(c_k)*grad(c),CWD),grad(v))*dx
+        # Create bilinear and linear forms
+        a = lhs(F)
+        L = rhs(F)
+        c = Function(V_c)   # new unknown function 
+        A = PETScMatrix()
+        assemble(a, tensor=A)
+        b = PETScVector()
+        assemble(L, tensor=b)
+        [bc.apply(A, b) for bc in bcs]
+        # Picard iterations
+        while eps > tol and iter < maxiter:
+            iter += 1
+            solve(A, c.vector(), b,"gmres", "ilu")
+            diff = c.vector().get_local() - c_k.vector().get_local()
+            abse = np.linalg.norm(diff, ord=np.Inf)
+            exsol = np.linalg.norm(c.vector().get_local(), ord=np.Inf)
+            eps=abse/exsol
+            #print ('iter=%d: norm=%g' % (iter, eps))
+            c_k.assign(c)   # update for next iteration
+        # Get the values of c 
+        nodal_values_c_k= c_k. vector()# intermediate step
+        array_c_k= nodal_values_c_k . get_local ()
+        #c_k_vertex_values = c_k.compute_vertex_values(mesh) # reset 
+        #snapshot[:, ct]= c_k_vertex_values
+        snapshot[:, ct]= array_c_k
+        del a, L, F, c, c_k, u,nodal_values_c_k, array_c_k,vmag, eps, tol,iter, maxiter, A, b
+        ct += 1
+
+# Save the snapshots Matrix
+import scipy.io 
+scipy.io.savemat("SnapshotsBM.mat", {"X": snapshot})
