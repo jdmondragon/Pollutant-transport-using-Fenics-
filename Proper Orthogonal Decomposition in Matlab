@@ -1,0 +1,46 @@
+clear 
+close all;
+clc
+format long 
+load('Ab90d')
+bt=b';
+load('Snapshots07')
+load('DirB')
+[m,n]=size(X);
+
+%% Eigenvalues and eigenvectors of the Gram matrix (small second dimension) 
+G=X'*X;
+[UG,SG,VG] = svd(G);
+
+%% Sort eigenvalues and select the reduced dimension k
+ds=diag(SG);
+tol=0.9999;
+ki=5;
+t=0.5;
+
+while t<tol
+    t=sum(ds(1:ki))/sum(ds);
+    ki=ki+1;
+end 
+
+k =ki;
+
+%% Compute the reduced basis for the first (long) dimension
+dinv= (ds(1:k)).^(-0.5);
+InvS=repmat(dinv',size(X,1),1);
+UC=  InvS.*(X*VG(:,1:k)); 
+ 
+Sv=SG.^(1/2);
+VCT=VG';
+XC=UC*Sv(1:k,1:k)*VCT(1:k,:);
+MSE = norm(X-XC)/norm(X);
+
+%% Compute cPOD in the reduce subspace 
+UCT=UC';
+APOD=UCT*A*UC;
+bPOD=UCT*bt;
+alpha=linsolve(APOD,bPOD);
+cPOD=UC*alpha;
+
+rerr= norm(cPOD-cFEM')/norm(cFEM');
+
