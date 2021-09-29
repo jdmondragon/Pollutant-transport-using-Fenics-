@@ -1,1 +1,171 @@
+from dolfin import *
+# parameters["reorder_dofs_serial"] = False
+import matplotlib.pyplot as plt
+import math
+import numpy as np
+set_log_level(LogLevel.ERROR)
+
+# Import the mesh 
+mesh = Mesh ('SS_VEL/Domain.xml.gz')
+with XDMFFile("mesh.xdmf") as infile:
+    infile.read(mesh)
+mvc = MeshValueCollection("size_t", mesh, 2)
+with XDMFFile("mf.xdmf") as infile:
+    infile.read(mvc, "name_to_read")
+mf = cpp.mesh.MeshFunctionSizet(mesh, mvc)
+
+# Defining the function space
+V_c = FunctionSpace(mesh,'Lagrange', 1)
+
+
+#import potential field in x axis
+f=HDF5File(mesh.mpi_comm(),'SS_VEL/velpot_x','r')#"r" means read 
+u=Function(V_c)
+f.read(u,'u')
+f.close()
+phix= u # save the potential field  
+#import potential field in y axis
+f=HDF5File(mesh.mpi_comm(),'SS_VEL/velpot_y','r')
+w=Function(V_c)
+f.read(w,'w')
+f.close()
+phiy= w # save the potential field  
+
+
+vel_x= grad(phix) # Velocity field
+vel_y= grad(phiy)
+
+# Define the inputs 
+#diffusivity
+diff=Constant(1.2e-5)
+# angle with respect the x axis 
+theta=Constant(pi/6)
+# velocity magnitude
+vmag=2
+# velocity
+u=vmag*(cos(theta)*vel_x+sin(theta)*vel_y)
+
+
+# Set up boundary condition (apply strong BCs)
+bc_Con= DirichletBC(V_c, Constant(2.1e-7), mf, 7)
+#zero concentration on the inflow face
+bc_Inx= DirichletBC(V_c, Constant(0), mf, 1)
+bc_Iny= DirichletBC(V_c, Constant(0), mf, 3)
+bcs= [ bc_Con, bc_Inx, bc_Iny]
+
+# Test and trial function
+v = TestFunction(V_c)
+c = TrialFunction(V_c)
+
+ # Source term
+f = Constant(0.0)
+
+#STABILIZATION TERMS
+h = CellDiameter(mesh)
+vnorm=sqrt(dot(u,u))
+Pe=(vnorm*h)/(2*diff)
+tau_supg=h/(2*vnorm)*(1+(9/(Pe**2)))**(-0.5)
+
+# Galerkin variational problem
+F=(diff*dot(grad(c),grad(v))+dot(u,grad(c))*v)*dx-f*v*dx#+(betta*c*v)*ds
+
+# Add SUPG stabilization terms
+F += dot(u,grad(v))*tau_supg*dot(u,grad(c))*dx
+
+# Create bilinear and linear forms
+a = lhs(F)
+L = rhs(F)
+
+# Solution function
+c= Function(V_c)
+# Assembling the A, b 
+A = PETScMatrix()
+assemble(a, tensor=A)
+b = PETScVector()
+assemble(L, tensor=b)
+[bc.apply(A, b) for bc in bcs]
+
+
+# Solve system
+solve(A, c.vector(), b,"gmres", "ilu")
+
+
+# We save the solution the concentration 
+file = File("Edit/SUPG/concFM_SUPG.pvd")
+file << c
+
+c_k = c # solution from SUPG stabilization 
+
+#STABILIZATION CROSSWIND TERMS
+
+alpha= Constant(0.7)
+I= Identity(mesh.geometry().dim())
+def q(c): 
+    return (sqrt(dot(dot(u,grad(c)),dot(u,grad(c))))/sqrt(dot(grad(c),grad(c))))
+
+del A, b, a, L, F, c
+
+# Define variational problem for Picard iteration
+c = TrialFunction(V_c)
+# Galerkin variational problem
+F=(diff*dot(grad(c),grad(v))+dot(u,grad(c))*v)*dx-f*v*dx#+(betta*c*v)*ds
+# Add SUPG stabilization terms
+F += dot(u,grad(v))*tau_supg*dot(u,grad(c))*dx
+# Add crosswind stabilization terms
+CWD=(I-(outer(u,u)/sqrt(dot(dot(u,u),dot(u,u)))))
+F += dot(dot(0.5*alpha*h*q(c_k)*grad(c),CWD),grad(v))*dx
+
+# Create bilinear and linear forms
+a = lhs(F)
+L = rhs(F)
+
+# Solution function
+c= Function(V_c)
+A = PETScMatrix()
+assemble(a, tensor=A)
+b = PETScVector()
+assemble(L, tensor=b)
+[bc.apply(A, b) for bc in bcs]
+
+# Picard iterations
+c = Function(V_c)   # new unknown function 
+eps = 1.0           # error measure ||u-u_k||
+tol = 1.0E-4        # tolerance
+iter = 0            # iteration counter
+maxiter = 45        # max no of iterations allowed
+while eps > tol and iter < maxiter:
+    iter += 1
+    #solve(a == L, c, bc,
+    #solver_parameters={'linear_solver': 'gmres',
+    #                    'preconditioner': 'ilu'})
+    solve(A, c.vector(), b,"gmres", "ilu")
+    diff = c.vector().get_local() - c_k.vector().get_local()
+    abse = np.linalg.norm(diff, ord=np.Inf)
+    exsol = np.linalg.norm(c.vector().get_local(), ord=np.Inf)
+    eps=abse/exsol
+    print ('iter=%d: norm=%g' % (iter, eps))
+    c_k.assign(c)   # update for next iteration
+
+
+# Save as VTK
+vtkfile= File('Edit/CWD/concFM_CWD30D4.pvd')
+vtkfile <<c_k
+
+A = assemble(a)
+b = assemble(L)
+[bc.apply(A, b) for bc in bcs]
+
+A_array = as_backend_type(A).mat()
+#Tranform from petcs to scipy 
+from scipy.sparse import csr_matrix
+A_sparray = csr_matrix(A_array.getValuesCSR()[::-1], shape = A_array.size)
+#Tranform from dolfin to numpy
+b_array=b.get_local()
+
+# Get the values of c 
+nodal_values_c_k= c_k. vector()# intermediate step
+array_c_k= nodal_values_c_k . get_local ()
+
+import scipy.io 
+scipy.io.savemat("Ab.mat", {"A": A_sparray, "b": b_array, "c30D4FEM": array_c_k})
 
